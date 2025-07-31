@@ -1,6 +1,6 @@
 # Spotify to MP3
 
-A simple way to download your Spotify playlist into MP3 files using Python 3.
+A simple way to download your Spotify playlist into MP3 files using Python 3. Please note that you could receive a "ERROR: The downloaded file is empty" message, which could be due to the pace of the requests or the video itself is problematic (copyright, age-restricted, etc.).
 
 ### Installing dependencies
 
