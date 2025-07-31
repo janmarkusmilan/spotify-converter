@@ -3,11 +3,12 @@ import os
 import sys
 import time
 import threading
+import re
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QPushButton, QLineEdit, QLabel, 
                             QProgressBar, QScrollArea, QFileDialog, QFrame,
                             QMessageBox)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl
+from PyQt5.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QUrl
 from PyQt5.QtGui import QPixmap, QDesktopServices
 import requests
 import spotipy
@@ -15,7 +16,6 @@ from spotipy.oauth2 import SpotifyClientCredentials
 from pytube import YouTube
 from pytube.exceptions import VideoUnavailable
 import yt_dlp
-import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,50 +30,73 @@ os.makedirs(os.path.join(DOWNLOADS_DIR, "Track"), exist_ok=True)
 os.makedirs(os.path.join(DOWNLOADS_DIR, "Playlist"), exist_ok=True)
 os.makedirs(os.path.join(DOWNLOADS_DIR, "Album"), exist_ok=True)
 
-class DownloadWorker(QThread):
+class WorkerSignals(QObject):
     progress_updated = pyqtSignal(str, int)
     download_finished = pyqtSignal(str, str)
     download_error = pyqtSignal(str, str)
+
+class DownloadWorker(QRunnable):
+    # progress_updated = pyqtSignal(str, int)
+    # download_finished = pyqtSignal(str, str)
+    # download_error = pyqtSignal(str, str)
     
     def __init__(self, track_id, track_info, download_dir):
         super().__init__()
         self.track_id = track_id
         self.track_info = track_info
         self.download_dir = download_dir
+        self.signals = WorkerSignals()
         self.stopped = False
         
     def run(self):
         try:
             # Search for the track on YouTube
             search_query = f"{self.track_info['artist']} - {self.track_info['title']}"
-            self.progress_updated.emit(self.track_id, 10)
+            # Sanitize filename
+            safe_filename = "".join([c for c in f"{self.track_info['artist']} - {self.track_info['title']}" if c.isalnum() or c in (' ', '-', '_')]).rstrip()
+            output_file = os.path.join(self.download_dir, f"{safe_filename}.mp3")
+            
+            # If the file already exists, we can consider it completed and skip it.
+            if os.path.exists(output_file):
+                self.signals.progress_updated.emit(self.track_id, 100)
+                self.signals.download_finished.emit(self.track_id, output_file)
+                return 
+            
+            self.signals.progress_updated.emit(self.track_id, 10)
+            
             
             # Use yt-dlp to search and find the best match
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
-                'default_search': 'ytsearch',
+                'default_search': 'ytsearch1',
                 'format': 'bestaudio/best',
                 'noplaylist': True,
+                'ignoreerrors': True, 
+                'retries': 5,           
+                'fragment_retries': 5,
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
                     'preferredquality': '192',
                 }],
                 'progress_hooks': [self._progress_hook],
-                'outtmpl': os.path.join(self.download_dir, f"{self.track_info['artist']} - {self.track_info['title']}.%(ext)s")
+                'outtmpl': os.path.join(self.download_dir, f"{safe_filename}.%(ext)s")
             }
             
-            self.progress_updated.emit(self.track_id, 20)
+            self.signals.progress_updated.emit(self.track_id, 20)
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 # Find the video
-                info = ydl.extract_info(f"ytsearch1:{search_query}", download=False)
+                info = ydl.extract_info(search_query, download=False)
+                # Check if any video was found
+                if not info.get('entries'):
+                    raise VideoUnavailable("No search results found on YouTube.")
                 video_item = info['entries'][0]
                 self.track_info['thumbnail'] = video_item.get('thumbnail', '')
                 self.track_info['youtube_url'] = video_item.get('webpage_url', '')
                 
-                self.progress_updated.emit(self.track_id, 30)
+                self.signals.progress_updated.emit(self.track_id, 30)
                 
                 if self.stopped:
                     return
@@ -81,23 +104,32 @@ class DownloadWorker(QThread):
                 # Download
                 ydl.download([video_item['webpage_url']])
                 
-            output_file = os.path.join(self.download_dir, f"{self.track_info['artist']} - {self.track_info['title']}.mp3")
-            self.download_finished.emit(self.track_id, output_file)
+            # output_file = os.path.join(self.download_dir, f"{safe_filename}.mp3")
+            # self.signals.download_finished.emit(self.track_id, output_file)
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+                self.signals.download_finished.emit(self.track_id, output_file)
+            else:
+                raise Exception("File is empty or missing (skipped by downloader).")
             
         except Exception as e:
-            self.download_error.emit(self.track_id, str(e))
+            self.signals.download_error.emit(self.track_id, str(e))
+        finally:
+            time.sleep(1)
     
     def _progress_hook(self, d):
+        if self.stopped:
+            return
+        
         if d['status'] == 'downloading':
             p = d.get('_percent_str', '0%') # Progress percentage
             try:
                 percentage = int(float(p.strip('%')))
                 scaled_percentage = 30 + int(percentage * 0.6)
-                self.progress_updated.emit(self.track_id, scaled_percentage)
+                self.signals.progress_updated.emit(self.track_id, scaled_percentage)
             except:
                 pass
         elif d['status'] == 'finished':
-            self.progress_updated.emit(self.track_id, 90)
+            self.signals.progress_updated.emit(self.track_id, 90)
     
     def stop(self):
         self.stopped = True
@@ -131,44 +163,60 @@ class SpotifyClient:
     
     def get_tracks_from_playlist(self, playlist_url):
         playlist_id = playlist_url.split('/')[-1].split('?')[0]
-        
-        results = self.sp.playlist(playlist_id)
+        results = self.sp.playlist_tracks(playlist_id)
         tracks = []
         
-        for item in results['tracks']['items']:
-            track = item['track']
-            tracks.append({
-                'title': track['name'],
-                'artist': track['artists'][0]['name'],
-                'id': track['id'],
-                'album': track['album']['name'],
-                'duration_ms': track['duration_ms'],
-                'spotify_url': track['external_urls']['spotify']
-            })
+        # for item in results['tracks']['items']:
+        while results:
+            for item in results['items']:
+                track = item['track']
+                if track:
+                    tracks.append({
+                        'title': track['name'],
+                        'artist': track['artists'][0]['name'],
+                        'id': track['id'],
+                        'album': track['album']['name'],
+                        'duration_ms': track['duration_ms'],
+                        'spotify_url': track['external_urls']['spotify']
+                    })
+            if results['next']:
+                results = self.sp.next(results)
+            else:
+                results = None
             
         return tracks
     
     def get_tracks_from_album(self, album_url):
         album_id = album_url.split('/')[-1].split('?')[0]
+        album_info = self.sp.album(album_id)
+        if not album_info:
+            return []
         
-        results = self.sp.album(album_id)
+        results = self.sp.album_tracks(album_id)
         tracks = []
         
-        for item in results['tracks']['items']:
-            tracks.append({
-                'title': item['name'],
-                'artist': item['artists'][0]['name'],
-                'id': item['id'],
-                'album': results['name'],
-                'duration_ms': item['duration_ms'],
-                'spotify_url': item['external_urls']['spotify']
-            })
+        # for item in results['tracks']['items']:
+        while results:
+            for item in results['items']:
+                if item:
+                    track_spotify_url = f"https://open.spotify.com/track/{item['id']}"
+                    tracks.append({
+                        'title': item['name'],
+                        'artist': item['artists'][0]['name'],
+                        'id': item['id'],
+                        'album': album_info['name'],
+                        'duration_ms': item['duration_ms'],
+                        'spotify_url': track_spotify_url
+                    })
+            if results['next']:
+                results = self.sp.next(results)
+            else:
+                results = None
             
         return tracks
     
     def get_track(self, track_url):
         track_id = track_url.split('/')[-1].split('?')[0]
-        
         track = self.sp.track(track_id)
         return {
             'title': track['name'],
@@ -282,7 +330,7 @@ class DownloadCard(QFrame):
     
     def set_progress(self, progress):
         self.progress_bar.setValue(progress)
-        self.progress_bar.setFormat("%p%")  # Show percentage with % symbol
+        self.progress_bar.setFormat("%p%") # Show percentage
     
     def set_completed(self, file_path):
         # self.file_path = file_path
@@ -290,25 +338,10 @@ class DownloadCard(QFrame):
         self.file_path = file_path
         self.progress_bar.setValue(100)
         self.progress_bar.setFormat("Completed") # Set the text to "Completed"
-        # Change the color to green to indicate success
-        self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: none;
-                border-radius: 6px;
-                background-color: #e0e0e0;
-                text-align: center;
-                font-size: 12px;
-            }
-            QProgressBar::chunk {
-                background-color: #1DB954; /* Green */
-                border-radius: 6px;
-            }
-        """)
     
     def set_error(self, error_message):
-        self.progress_bar.setValue(0) # Just set progress to 0 for errors
-        self.progress_bar.setFormat("Error")  # Show error text
-        # Change the color to red to indicate error
+        self.progress_bar.setValue(100)
+        self.progress_bar.setFormat("Error") # Show error text
         self.progress_bar.setStyleSheet("""
             QProgressBar {
                 border: none;
@@ -331,6 +364,8 @@ class MainWindow(QMainWindow):
         self.spotify_client = SpotifyClient()
         self.download_workers = {}
         self.download_cards = {}
+        self.threadpool = QThreadPool()
+        self.threadpool.setMaxThreadCount(4) 
         self.active_download_count = 0
         
         # Set application style
@@ -479,10 +514,9 @@ class MainWindow(QMainWindow):
     
     def process_url(self):
         url = self.url_input.text().strip()
-        
-        # if not url:
-        #     self.show_error("Please enter a valid Spotify URL")
-        #     return
+        if not url:
+            self.show_error("Please enter a valid Spotify URL")
+            return
             
         # self.status_label.setText("Processing URL...")
         self.download_btn.setEnabled(False)
@@ -499,18 +533,20 @@ class MainWindow(QMainWindow):
         """)
         
         try:
+            # Sanitize folder name helper function
+            def sanitize_folder_name(name):
+                return "".join([c for c in name if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+            
             if self.spotify_client.is_playlist(url):
                 self.status_label.setText("Fetching playlist tracks...")
                 playlist_name = self.spotify_client.get_playlist_name(url)
-                # Sanitize folder name
-                folder_name = "".join([c for c in playlist_name if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+                folder_name = sanitize_folder_name(playlist_name)
                 tracks = self.spotify_client.get_tracks_from_playlist(url)
                 download_dir = os.path.join(DOWNLOADS_DIR, "Playlist", folder_name)
             elif self.spotify_client.is_album(url):
                 self.status_label.setText("Fetching album tracks...")
                 album_name = self.spotify_client.get_album_name(url)
-                # Sanitize folder name
-                folder_name = "".join([c for c in album_name if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+                folder_name = sanitize_folder_name(album_name)
                 tracks = self.spotify_client.get_tracks_from_album(url)
                 download_dir = os.path.join(DOWNLOADS_DIR, "Album", folder_name)
             elif self.spotify_client.is_track(url):
@@ -579,19 +615,20 @@ class MainWindow(QMainWindow):
         self.download_cards[track_id] = card
         
         # Add new cards at the top
-        if self.scroll_layout.count() > 0:
-            self.scroll_layout.insertWidget(0, card)
-        else:
-            self.scroll_layout.addWidget(card)
+        # if self.scroll_layout.count() > 0:
+        #     self.scroll_layout.insertWidget(0, card)
+        # else:
+        #     self.scroll_layout.addWidget(card)
+        self.scroll_layout.insertWidget(0, card)
         
         # Create worker
         worker = DownloadWorker(track_id, track, download_dir)
-        worker.progress_updated.connect(self.update_progress)
-        worker.download_finished.connect(self.download_completed)
-        worker.download_error.connect(self.download_error)
+        worker.signals.progress_updated.connect(self.update_progress)
+        worker.signals.download_finished.connect(self.download_completed)
+        worker.signals.download_error.connect(self.download_error)
         
         self.download_workers[track_id] = worker
-        worker.start()
+        self.threadpool.start(worker) # worker.start()
     
     def update_progress(self, track_id, progress):
         if track_id in self.download_cards:
