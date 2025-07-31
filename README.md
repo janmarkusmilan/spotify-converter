@@ -12,4 +12,4 @@ Copy and paste (and run) the following line in your terminal session to install 
 pip3 install PyQt5 requests spotipy youtube_dl youtube_search yt-dlp python-dotenv ffmpeg
 ```
 
-![App Screen](https://imgur.com/a/noRhw4v)
+![App Screen](https://i.imgur.com/NluslUU.png)
